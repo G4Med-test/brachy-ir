@@ -1,75 +1,82 @@
-"""Turns the output of one validation run into plots for the Geant Validation Portal.
+#!/usr/bin/env python
 
-The CI imports this file and calls two functions, once for every macro listed in
-validation/config.json:
+# brachy-ir portal parser: metadata() reads the macro, parse() the "h20"
+# 2D energy-deposition map (TH2F) written to brachytherapy.root, reduced to
+# a radial relative-dose profile g(r).
+#
+# Ported from geant-config-generator/tests/geant4/brachy-ir/parser.py
+# (gts.BaseParser, which merged repeated-seed jobs and shelled out to
+# `root -l -b -q brachy_relative_dose.C`) to the module-level
+# metadata()/parse() API expected by ci-workflows/validation/export.py. The
+# radial-binning computation from brachy_relative_dose.C is reproduced
+# directly with uproot (no ROOT binary, no PyROOT on the runner); there is
+# no job-group merge any more — one macro means one run.
+import math
+import os
 
-1. metadata(commands)  BEFORE the simulation: describe the run from its macro.
-2. parse(job)          AFTER the simulation: read the output files, return plots.
+from geantval import getJSON, one_command, single_run
 
-You only have to edit the lines marked TODO. Example with macro/example.mac:
-
-    commands = [("/myapp/phys/addPhysics", "FTFP_BERT"), ("/run/initialize", ""),
-                ("/gun/particle", "proton"), ("/gun/energy", "100 MeV"), ...]
-
-    metadata(commands) -> {"TEST": "MyTest", "PHYSICS_LIST": "FTFP_BERT",
-                           "PARTICLE": "proton", "ENERGY": 100.0}
-
-    job = that dict + {"path": "<directory of the run>", "VERSION": "11.3.2"}
-    parse(job) -> one plot per `yield`
-
-The run directory contains the files your application wrote with relative names
-(here result.txt) and the captured standard output (test_stdout.txt).
-
-Helpers from ci-workflows/validation/geantval.py:
-- one_command(commands, "/cmd"): value of a command that appears exactly once
-  (error if missing or repeated, so the metadata always matches the macro);
-- energy_mev("100 MeV"): energy in MeV;
-- getJSON(job, ...): builds one plot in the portal format (see parse below).
-"""
-from pathlib import Path
-
-from geantval import energy_mev, getJSON, one_command
+SOURCE_PARTICLE = {"Flexi": "Ir-192", "Oncura": "I-125",
+                   "Leipzig": "Ir-192", "TG186": "Ir-192"}
 
 
 def metadata(commands):
-    """Describe one run, reading every setting from its macro.
+    single_run(commands)
+    return {"TEST": "brachy-ir",
+            "PHYSLIST": one_command(commands, "/testem/phys/addPhysics"),
+            "SOURCE": one_command(commands, "/source/switch")}
 
-    The returned dict must contain "TEST" (the test name shown on the portal);
-    add whatever parse() needs. Raise an error if the macro is not suitable.
-    """
-    return {
-        "TEST": "MyTest",  # TODO: your test name
-        "PHYSICS_LIST": one_command(commands, "/myapp/phys/addPhysics"),  # TODO: your command
-        "PARTICLE": one_command(commands, "/gun/particle"),
-        "ENERGY": energy_mev(one_command(commands, "/gun/energy")),
-    }
+
+def read_h20(path):
+    import uproot
+
+    with uproot.open(path) as root:
+        hist = root["h20"]
+        xcenters = hist.axis(0).centers(flow=False).tolist()
+        ycenters = hist.axis(1).centers(flow=False).tolist()
+        values = hist.values(flow=False)  # shape (801, 801)
+    return xcenters, ycenters, values
 
 
 def parse(job):
-    """Read the output of the run in job["path"] and yield one plot per `yield`."""
-    # TODO: read your output file. This example expects two columns, x and y,
-    # one point per line; lines starting with # are comments.
-    x, y = [], []
-    for line in (Path(job["path"]) / "result.txt").read_text().splitlines():
-        if line.strip() and not line.startswith("#"):
-            x_value, y_value = line.split()
-            x.append(float(x_value))
-            y.append(float(y_value))
+    xcenters, ycenters, values = read_h20(os.path.join(job["path"], "brachytherapy.root"))
 
-    # "chart" is a set of points (x, y). For a histogram use "histogram" with
-    # binEdgeLow, binEdgeHigh and binContent instead of xValues and yValues.
-    # Optional uncertainties: yStatErrorsPlus/Minus, ySysErrorsPlus/Minus.
-    yield getJSON(
-        job, "chart",
-        mctool_name="GEANT4",
-        mctool_model=job["PHYSICS_LIST"],
-        observableName="TODO observable",  # e.g. "attenuation coefficient"
-        targetName="TODO target",          # e.g. "water"
-        beamParticle=job["PARTICLE"],
-        beamEnergies=[job["ENERGY"]],      # MeV
-        title="TODO title",
-        xAxisName="TODO x, unit",
-        yAxisName="TODO y, unit",
-        xValues=x,
-        yValues=y,
-    )
+    energy_map = [0.] * 401
+    voxels = [0] * 401
+    for ix, xx in enumerate(xcenters):
+        row = values[ix]
+        for iy, yy in enumerate(ycenters):
+            radius = math.sqrt(xx * xx + yy * yy)  # mm
+            if radius == 0.:
+                continue
+            rad_int = round(4 * radius)
+            if 0 < rad_int <= 400:
+                energy_map[rad_int] += float(row[iy])
+                voxels[rad_int] += 1
+
+    if voxels[40] == 0:
+        raise ValueError("No energy deposited at the 1 cm / 90 deg reference point")
+    norm = energy_map[40] / voxels[40]
+
+    xvalues, yvalues = [], []
+    for i in range(401):
+        r_cm = i / 40.
+        if r_cm <= 0.05:
+            continue
+        dose = energy_map[i] / voxels[i] / norm if voxels[i] > 0 else 0.
+        xvalues.append(r_cm)
+        yvalues.append(dose)
+
+    rjson = getJSON(job, "chart",
+                     mctool_name="GEANT4",
+                     mctool_model=job["PHYSLIST"],
+                     observableName="dose rate",
+                     targetName="Water",
+                     beamParticle=SOURCE_PARTICLE[job["SOURCE"]],
+                     beamEnergies=[1., 2., 3., 4., 5.],
+                     title="dose rate",
+                     xAxisName="Distance from source (cm)",
+                     yAxisName="Dose rate distribution g(r)",
+                     xValues=xvalues,
+                     yValues=yvalues)
+    yield rjson

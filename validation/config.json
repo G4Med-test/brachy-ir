@@ -1,3 +1,6 @@
 {
-  "macros": ["example.mac"]
+  "macros": [
+    "Flexi_emstandard_opt0.mac",
+    "Oncura_emstandard_opt0.mac"
+  ]
 }
